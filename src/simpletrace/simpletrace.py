@@ -6,6 +6,8 @@ import sys
 import threading
 from types import FunctionType
 
+blacklist = ['__parent__', '__str__', '__repr__']
+
 # the global counter stuff is from:
 # http://stackoverflow.com/questions/12479574/python-global-counter
 class IndentCounter(object):
@@ -55,17 +57,6 @@ def is_class_private_name(name):
     # Exclude system defined names such as __init__, __add__ etc
     return name.startswith("__") and not name.endswith("__")
 
-def method_name(method):
-    """ Return a method's name.
-
-    This function returns the name the method is accessed by from
-    outside the class (i.e. it prefixes "private" methods appropriately).
-    """
-    mname = get_name(method)
-    if is_class_private_name(mname):
-        mname = "_%s%s" % (get_name(method.im_class), mname)
-    return mname
-
 def format_arg_value(arg_val):
     """ Return a string representing a (name, value) pair.
 
@@ -75,7 +66,7 @@ def format_arg_value(arg_val):
     arg, val = arg_val
     return "%s = %r" % (arg, val)
 
-def echo(fn, write=sys.stdout.write):
+def echo(fn, name=None, class_name=None, write=sys.stdout.write):
     """ Echo calls to a function.
 
     Returns a decorated version of the input function which "echoes" calls
@@ -92,28 +83,24 @@ def echo(fn, write=sys.stdout.write):
 
     @functools.wraps(fn)
     def wrapped(*v, **k):
+        global echo_indent
+
         # Collect function arguments by chaining together positional,
         # defaulted, extra positional and keyword arguments.
-        global echo_indent
         positional = map(format_arg_value, zip(argnames, v))
         defaulted = [format_arg_value((a, argdefs[a]))
                      for a in argnames[len(v):] if a not in k]
         nameless = map(repr, v[argcount:])
         keyword = map(format_arg_value, k.items())
         args = positional + defaulted + nameless + keyword
-        # we assume this always hold:
-        classname = get_classname(fn)
-        if not classname:
-            if argnames[0] == 'self':
-                instance = v[0]
-                classname = instance.__class__.__name__
 
         indent = echo_indent.indent() * "    "
-        write("%(indent)sTRACE: %(module)s.%(classname)s.\033[1m%(name)s\033[22m%(args)s\n\n" % (
+        write("%(indent)sTRACE: %(module)s.%(classname)s.\033[1m%(name)s\033[22m (%(actual_name)s)%(args)s\n\n" % (
                     {'indent': indent,
                      'module': get_modulename(fn),
-                     'classname': classname,
-                     'name': get_name(fn),
+                     'classname': class_name or get_classname(fn),
+                     'name': name or get_name(fn),
+                     'actual_name': get_name(fn),
                      'args': ("\n" + indent + "    ").join(['']+args)
                     }))
         result = fn(*v, **k)
@@ -121,38 +108,46 @@ def echo(fn, write=sys.stdout.write):
         return result
     return wrapped
 
-def echo_instancemethod(klass, method, write=sys.stdout.write):
+def echo_instancemethod(klass, method, name, write=sys.stdout.write):
     """ Change an instancemethod so that calls to it are echoed.
 
     Replacing a classmethod is a little more tricky.
     See: http://www.python.org/doc/current/ref/types.html
     """
-    mname = method_name(method)
-    never_echo = "__str__", "__repr__", # Avoid recursion printing method calls
-    if mname in never_echo:
+    class_name = klass.__name__
+    if name in blacklist:
         pass
     elif is_classmethod(method):
         if hasattr(method.im_func, 'func_code'):
-            setattr(klass, mname, classmethod(echo(method.im_func, write)))
+            setattr(klass, name, classmethod(
+                    echo(method.im_func, name, class_name, write)))
     else:
         if hasattr(method, 'func_code'):
-            setattr(klass, mname, echo(method, write))
+            setattr(klass, name,
+                    echo(method, name, class_name, write))
 
 def echo_class(klass, write=sys.stdout.write):
     """ Echo calls to class methods and static functions
     """
-    for _, method in inspect.getmembers(klass, inspect.ismethod):
-        echo_instancemethod(klass, method, write)
-    for _, fn in inspect.getmembers(klass, inspect.isfunction):
-        setattr(klass, get_name(fn), staticmethod(echo(fn, write)))
-    for _, prop in inspect.getmembers(klass, lambda member: type(member) == property):
-        if type(prop.fget) == FunctionType and hasattr(prop.fget, '__name__'):
-            setattr(klass, prop.fget.__name__, property(echo(prop.fget, write), prop.fset, prop.fdel))
+    class_name = klass.__name__
+    for name, method in inspect.getmembers(klass, inspect.ismethod):
+        echo_instancemethod(klass, method, name, write)
+    for name, fn in inspect.getmembers(klass, inspect.isfunction):
+        if name not in blacklist:
+            setattr(klass, name, staticmethod(
+                    echo(fn, name, class_name, write)))
+    for name, prop in inspect.getmembers(klass, lambda member: type(member) == property):
+        if type(prop.fget) == FunctionType and \
+           name not in blacklist:
+            setattr(klass, name,
+                    property(echo(prop.fget, name, class_name, write),
+                             prop.fset, prop.fdel))
 
 def echo_module(mod, write=sys.stdout.write):
     """ Echo calls to functions and methods in a module.
     """
+    # todo: exclude imports somehow?
     for fname, fn in inspect.getmembers(mod, inspect.isfunction):
-        setattr(mod, fname, echo(fn, write))
+        setattr(mod, fname, echo(fn, fname, write=write))
     for _, klass in inspect.getmembers(mod, inspect.isclass):
-        echo_class(klass, write)
+        echo_class(klass, write=write)
